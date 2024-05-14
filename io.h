@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/types.h>
 
 #define IO_VERSION_MAJOR 0
 #define IO_VERSION_MINOR 0
@@ -45,8 +46,10 @@ struct io_os_overlap {
 enum io_optype {
     IO_VOID,
     IO_RECV,
+    IO_READ,
     IO_SEND,
-    IO_ACCEPT,
+    IO_WRITE,
+    IO_ACCEPT
 };
 
 #define IO_SOCKADDR_IN_SIZE 16
@@ -57,10 +60,10 @@ struct io_operation {
     struct io_resource *res;
     void *user;
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     io_os_handle accepted;
     struct io_os_overlap ov;
-    #endif
+#endif
 };
 
 enum io_evtype {
@@ -76,14 +79,14 @@ struct io_event {
     void *user;
 
     union {
-        uint32_t num;
+        int32_t num;
         io_handle accepted;
     };
 };
 
 struct io_context;
 
-typedef void (*io_callback)(struct io_context *ioc, struct io_event);
+typedef bool (*io_callback)(struct io_context *ioc, struct io_event *ev);
 
 enum io_restype {
     IO_RES_VOID,
@@ -99,10 +102,10 @@ struct io_resource {
 
     io_callback callback;
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     void *acceptfn;
     char accept_buffer[2 * (IO_SOCKADDR_IN_SIZE + 16)];
-    #endif
+#endif
 };
 
 /*
@@ -110,7 +113,6 @@ struct io_resource {
  */
 #if IO_PLATFORM_LINUX
 struct io_submission_queue {
-    _Atomic unsigned int *head;
     _Atomic unsigned int *tail;
     unsigned int *mask;
     unsigned int *array;
@@ -139,11 +141,13 @@ struct io_context {
     struct io_resource *res;
     struct io_operation *ops;
 
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     struct io_submission_queue submissions;
     struct io_completion_queue completions;
-    #endif
+#endif
 };
+
+struct io_resource *res_from_handle(struct io_context *ioc, io_handle handle);
 
 bool io_global_init(void);
 void io_global_free(void);
@@ -163,9 +167,17 @@ bool io_recv(struct io_context *ioc,
              void *user, io_handle handle,
              void *dsc, uint32_t max);
 
+bool io_read(struct io_context *ioc,
+             void *user, io_handle handle,
+             off_t off, void *dsc, size_t max);
+
 bool io_send(struct io_context *ioc,
              void *user, io_handle handle,
              void *src, uint32_t num);
+
+bool io_write(struct io_context *ioc,
+              void *user, io_handle handle,
+              off_t offset, void *dsc, size_t max);
 
 bool io_accept(struct io_context *ioc,
                void *user, io_handle handle);

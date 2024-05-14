@@ -19,6 +19,9 @@
 #include <sys/syscall.h>
 #include <arpa/inet.h>
 #include <linux/io_uring.h>
+#include <string.h>
+#include <errno.h>
+#include <stdlib.h>
 #endif
 
 #define IO_DEBUG
@@ -32,21 +35,21 @@
 
 bool io_global_init(void)
 {
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     WSADATA data;
     return WSAStartup(MAKEWORD(2, 2), &data) == NO_ERROR;
-    #endif
+#endif
 
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     return true;
-    #endif
+#endif
 }
 
 void io_global_free(void)
 {
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     WSACleanup();
-    #endif
+#endif
 }
 
 #if IO_PLATFORM_WINDOWS
@@ -137,7 +140,6 @@ static bool io_init_linux(struct io_context *ioc)
     }
 
     /* Save useful fields for later easy reference */
-    ioc->submissions.head = (_Atomic unsigned*) (sq_ptr + p.sq_off.head);
     ioc->submissions.tail = (_Atomic unsigned*) (sq_ptr + p.sq_off.tail);
     ioc->submissions.mask = (unsigned*) (sq_ptr + p.sq_off.ring_mask);
     ioc->submissions.array = sq_ptr + p.sq_off.array;
@@ -174,21 +176,18 @@ static bool start_uring_op(struct io_context *ioc,
                            struct io_uring_sqe sqe)
 {
     unsigned int mask = *ioc->submissions.mask;
-    unsigned int tail = atomic_load(ioc->submissions.tail);
-    unsigned int head = atomic_load(ioc->submissions.head);
-
-    if (tail >= head + ioc->submissions.limit)
-        return false;
-
+    unsigned int tail = *ioc->submissions.tail;
     unsigned int index = tail & mask;
+    
     ioc->submissions.entries[index] = sqe;
     ioc->submissions.array[index] = index;
 
-    atomic_store(ioc->submissions.tail, tail+1);
+    atomic_store_explicit(ioc->submissions.tail, tail+1, memory_order_release);
 
     int ret = io_uring_enter(ioc->os_handle, 1, 0, 0);
-    if (ret < 0)
+    if (ret < 0) {
         return false;
+    }
     
     return true;
 }
@@ -200,13 +199,13 @@ static void clear_res(struct io_resource *res)
     res->pending = 0;
     res->callback = NULL;
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     res->os_handle = INVALID_HANDLE_VALUE;
-    #endif
+#endif
 
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     res->os_handle = -1;
-    #endif
+#endif
 }
 
 bool io_init(struct io_context   *ioc,
@@ -228,27 +227,27 @@ bool io_init(struct io_context   *ioc,
     for (uint16_t i = 0; i < max_ops; i++)
         ops[i].type = IO_VOID;
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     return io_init_windows(ioc);
-    #endif
+#endif
 
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     return io_init_linux(ioc);
-    #endif
+#endif
 }
 
 static void
 close_internal(struct io_context  *ioc,
                struct io_resource *res)
 {
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     if (res->type == IO_RES_SOCKET)
         closesocket((SOCKET) res->os_handle);
     else
         CloseHandle(res->os_handle);
-    #elif IO_PLATFORM_LINUX
+#elif IO_PLATFORM_LINUX
     close(res->os_handle);
-    #endif
+#endif
 
     // Mark associated operation structures as unused
     for (uint16_t i = 0, marked = 0; marked < res->pending; i++) {
@@ -268,7 +267,7 @@ close_internal(struct io_context  *ioc,
         res->gen = 0;
 }
 
-static struct io_resource*
+struct io_resource*
 res_from_handle(struct io_context *ioc, io_handle handle)
 {
     if (handle == IO_INVALID)
@@ -321,13 +320,13 @@ void io_free(struct io_context *ioc)
         if (ioc->res[i].type != IO_RES_VOID)
             close_internal(ioc, &ioc->res[i]);
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     io_free_windows(ioc);
-    #endif
+#endif
 
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     io_free_linux(ioc);
-    #endif
+#endif
 }
 
 static struct io_operation*
@@ -356,6 +355,22 @@ static bool io_recv_linux(struct io_context   *ioc,
     sqe.user_data = (uint64_t) op;
     return start_uring_op(ioc, sqe);
 }
+
+static bool io_read_linux(struct io_context   *ioc,
+                          struct io_resource  *res,
+                          struct io_operation *op,
+                          off_t off, void *dst, size_t max)
+{
+    struct io_uring_sqe sqe;
+    memset(&sqe, 0, sizeof(sqe));
+    sqe.opcode = IORING_OP_READ;
+    sqe.fd   = (int) res->os_handle;
+    sqe.off = off;
+    sqe.addr = (uint64_t) dst;
+    sqe.len  = max;
+    sqe.user_data = (uint64_t) op;
+    return start_uring_op(ioc, sqe);
+}
 #endif
 
 #if IO_PLATFORM_LINUX
@@ -368,6 +383,22 @@ static bool io_send_linux(struct io_context   *ioc,
     memset(&sqe, 0, sizeof(sqe));
     sqe.opcode = IORING_OP_WRITE;
     sqe.fd   = (int) res->os_handle;
+    sqe.addr = (uint64_t) src;
+    sqe.len  = num;
+    sqe.user_data = (uint64_t) op;
+    return start_uring_op(ioc, sqe);
+}
+
+static bool io_write_linux(struct io_context   *ioc,
+                           struct io_resource  *res,
+                           struct io_operation *op,
+                           off_t off, void *src, uint32_t num)
+{
+    struct io_uring_sqe sqe;
+    memset(&sqe, 0, sizeof(sqe));
+    sqe.opcode = IORING_OP_WRITE;
+    sqe.fd   = (int) res->os_handle;
+    sqe.off = off;
     sqe.addr = (uint64_t) src;
     sqe.len  = num;
     sqe.user_data = (uint64_t) op;
@@ -403,9 +434,17 @@ static bool io_recv_windows(struct io_context   *ioc,
 
     memset(&op->ov, 0, sizeof(struct io_os_overlap));
     int ok = ReadFile(res->os_handle, dst, max, NULL, (OVERLAPPED*) &op->ov);
-	if (!ok && GetLastError() != ERROR_IO_PENDING)
-		return false;
+    if (!ok && GetLastError() != ERROR_IO_PENDING)
+        return false;
     return true;
+}
+
+static bool io_read_windows(struct io_context   *ioc,
+                            struct io_resource  *res,
+                            struct io_operation *op,
+                            off_t off, void *dst, size_t max)
+{
+    return false;
 }
 #endif
 
@@ -419,9 +458,17 @@ static bool io_send_windows(struct io_context   *ioc,
 
     memset(&op->ov, 0, sizeof(struct io_os_overlap));
     int ok = ReadFile(res->os_handle, src, num, NULL, (OVERLAPPED*) &op->ov);
-	if (!ok && GetLastError() != ERROR_IO_PENDING)
-		return false;
+    if (!ok && GetLastError() != ERROR_IO_PENDING)
+        return false;
     return true;
+}
+
+static bool io_write_windows(struct io_context   *ioc,
+                             struct io_resource  *res,
+                             struct io_operation *op,
+                             off_t off, void *src, uint32_t num)
+{
+    return false;
 }
 #endif
 
@@ -451,7 +498,7 @@ static bool io_accept_windows(struct io_context   *ioc,
                           sizeof(struct sockaddr_in) + 16,
                           &num, (OVERLAPPED*) &op->ov);
     if (!ok && GetLastError() != ERROR_IO_PENDING) {
-		DEBUG_LOG("AcceptEx failure\n");
+        DEBUG_LOG("AcceptEx failure\n");
         closesocket(new_os_handle);
         return false;
     }
@@ -478,15 +525,49 @@ bool io_recv(struct io_context *ioc,
 
     enum io_optype type = IO_RECV;
     
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     if (!io_recv_linux(ioc, res, op, dst, max))
         return false;
-    #endif
+#endif
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     if (!io_recv_windows(ioc, res, op, dst, max))
         return false;
-    #endif
+#endif
+
+    res->pending++;
+    op->res = res;
+    op->type = type;
+    op->user = user;
+    return true;
+}
+
+bool io_read(struct io_context *ioc,
+             void *user, io_handle handle,
+             off_t off, void *dst, size_t max)
+{
+    struct io_operation *op;
+    struct io_resource *res;
+
+    res = res_from_handle(ioc, handle);
+    if (res == NULL)
+        return false;
+    
+    op = find_unused_op(ioc);
+    if (op == NULL)
+        return false;
+
+    enum io_optype type = IO_READ;
+    
+#if IO_PLATFORM_LINUX
+    if (!io_read_linux(ioc, res, op, off, dst, max))
+        return false;
+#endif
+
+#if IO_PLATFORM_WINDOWS
+    if (!io_read_windows(ioc, res, op, off, dst, max))
+        return false;
+#endif
 
     res->pending++;
     op->res = res;
@@ -512,15 +593,49 @@ bool io_send(struct io_context *ioc,
 
     enum io_optype type = IO_SEND;
     
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     if (!io_send_linux(ioc, res, op, src, num))
         return false;
-    #endif
+#endif
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     if (!io_send_windows(ioc, res, op, src, num))
         return false;
-    #endif
+#endif
+
+    res->pending++;
+    op->res = res;
+    op->type = type;
+    op->user = user;
+    return true;
+}
+
+bool io_write(struct io_context *ioc,
+              void *user, io_handle handle,
+              off_t off, void *src, size_t num)
+{
+    struct io_operation *op;
+    struct io_resource *res;
+
+    res = res_from_handle(ioc, handle);
+    if (res == NULL)
+        return false;
+    
+    op = find_unused_op(ioc);
+    if (op == NULL)
+        return false;
+
+    enum io_optype type = IO_WRITE;
+    
+#if IO_PLATFORM_LINUX
+    if (!io_write_linux(ioc, res, op, off, src, num))
+        return false;
+#endif
+
+#if IO_PLATFORM_WINDOWS
+    if (!io_write_windows(ioc, res, op, off, src, num))
+        return false;
+#endif
 
     res->pending++;
     op->res = res;
@@ -545,15 +660,15 @@ bool io_accept(struct io_context *ioc,
 
     enum io_optype type = IO_ACCEPT;
 
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     if (!io_accept_linux(ioc, res, op, res->os_handle))
         return false;
-    #endif
+#endif
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     if (!io_accept_windows(ioc, res, op, res->os_handle))
         return false;
-    #endif
+#endif
 
     res->pending++;
     op->res = res;
@@ -579,17 +694,17 @@ io_open_file_windows(struct io_context *ioc,
                      const char *file, int flags)
 {
     unsigned long access = 0;
-	if (flags & IO_ACCESS_RD) access |= GENERIC_READ;
-	if (flags & IO_ACCESS_WR) access |= GENERIC_WRITE;
+    if (flags & IO_ACCESS_RD) access |= GENERIC_READ;
+    if (flags & IO_ACCESS_WR) access |= GENERIC_WRITE;
 
-	io_os_handle os_handle = CreateFileA(file, access, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
-	if (os_handle == INVALID_HANDLE_VALUE)
-		return INVALID_HANDLE_VALUE;
+    io_os_handle os_handle = CreateFileA(file, access, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+    if (os_handle == INVALID_HANDLE_VALUE)
+        return INVALID_HANDLE_VALUE;
 
     if (CreateIoCompletionPort(os_handle, ioc->os_handle, 0, 0) == NULL) {
-		CloseHandle(os_handle);
-		return INVALID_HANDLE_VALUE;
-	}
+        CloseHandle(os_handle);
+        return INVALID_HANDLE_VALUE;
+    }
 
     return os_handle;
 }
@@ -603,10 +718,10 @@ io_open_file_linux(struct io_context *ioc,
     (void) ioc;
 
     int flags2 = 0;
-	if (flags & IO_ACCESS_RD) flags2 |= O_RDONLY;
-	if (flags & IO_ACCESS_WR) flags2 |= O_WRONLY;
+    if (flags & IO_ACCESS_RD) flags2 |= O_RDONLY;
+    if (flags & IO_ACCESS_WR) flags2 |= O_WRONLY;
 
-	return open(file, flags2);
+    return open(file, flags2);
 }
 #endif
 
@@ -620,17 +735,17 @@ io_handle io_open_file(struct io_context *ioc,
     if (res == NULL)
         return IO_INVALID;
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     os_handle = io_open_file_windows(ioc, file, flags);
     if (os_handle == INVALID_HANDLE_VALUE)
         return IO_INVALID;
-    #endif
+#endif
 
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     os_handle = io_open_file_linux(ioc, file, flags);
     if (os_handle < 0)
         return IO_INVALID;
-    #endif
+#endif
 
     res->type = IO_RES_FILE;
     res->pending = 0;
@@ -645,23 +760,23 @@ io_create_file_windows(struct io_context *ioc,
 {
     unsigned long flags2 = 0;
 
-	if (flags & IO_CREATE_CANTEXIST)
-		flags2 = CREATE_NEW;
-	else {
-		if (flags & IO_CREATE_OVERWRITE)
-			flags2 = CREATE_ALWAYS;
-		else
-			flags2 = OPEN_ALWAYS;
-	}
+    if (flags & IO_CREATE_CANTEXIST)
+        flags2 = CREATE_NEW;
+    else {
+        if (flags & IO_CREATE_OVERWRITE)
+            flags2 = CREATE_ALWAYS;
+        else
+            flags2 = OPEN_ALWAYS;
+    }
 
-	io_os_handle os_handle = CreateFileA(file, GENERIC_WRITE, 0, NULL, flags2, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
-	if (os_handle == INVALID_HANDLE_VALUE)
+    io_os_handle os_handle = CreateFileA(file, GENERIC_WRITE, 0, NULL, flags2, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+    if (os_handle == INVALID_HANDLE_VALUE)
         return INVALID_HANDLE_VALUE;
 
     if (CreateIoCompletionPort(os_handle, ioc->os_handle, 0, 0) == NULL) {
-		CloseHandle(os_handle);
-		return INVALID_HANDLE_VALUE;
-	}
+        CloseHandle(os_handle);
+        return INVALID_HANDLE_VALUE;
+    }
 
     return os_handle;
 }
@@ -676,15 +791,15 @@ io_create_file_linux(struct io_context *ioc,
 
     int flags2 = O_CREAT | O_WRONLY;
 
-	if (flags & IO_CREATE_CANTEXIST)
-		flags2 |= O_EXCL;
-	else {
-		if (flags & IO_CREATE_OVERWRITE)
-			flags2 |= O_TRUNC;
-	}
+    if (flags & IO_CREATE_CANTEXIST)
+        flags2 |= O_EXCL;
+    else {
+        if (flags & IO_CREATE_OVERWRITE)
+            flags2 |= O_TRUNC;
+    }
 
     // TODO: is 0666 ok?
-	return open(file, flags2, 0666);
+    return open(file, flags2, 0666);
 }
 #endif
 
@@ -698,17 +813,17 @@ io_handle io_create_file(struct io_context *ioc,
     if (res == NULL)
         return IO_INVALID;
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     os_handle = io_create_file_windows(ioc, file, flags);
     if (os_handle == INVALID_HANDLE_VALUE)
         return IO_INVALID;
-    #endif
+#endif
 
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     os_handle = io_create_file_linux(ioc, file, flags);
     if (os_handle < 0)
         return IO_INVALID;
-    #endif
+#endif
 
     res->type = IO_RES_FILE;
     res->pending = 0;
@@ -730,13 +845,13 @@ io_handle io_start_server(struct io_context *ioc,
             return IO_INVALID;
     }
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     SOCKET fd;
-    #endif
+#endif
     
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     int fd;
-    #endif
+#endif
     
     struct io_resource *res;
 
@@ -746,15 +861,15 @@ io_handle io_start_server(struct io_context *ioc,
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
 
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     if (fd < 0)
         return IO_INVALID;
-    #endif
+#endif
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     if (fd == INVALID_SOCKET)
         return IO_INVALID;
-    #endif
+#endif
 
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char*) &one, sizeof(one));
@@ -764,44 +879,44 @@ io_handle io_start_server(struct io_context *ioc,
     buf.sin_port = htons(port);
     buf.sin_addr = addr2;
     if (bind(fd, (struct sockaddr*) &buf, sizeof(buf))) {
-        #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
         closesocket(fd);
-        #else
+#else
         close(fd);
-        #endif
+#endif
         return IO_INVALID;
     }
 
     int backlog = 32;
     if (listen(fd, backlog)) {
-        #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
         closesocket(fd);
-        #else
+#else
         close(fd);
-        #endif
+#endif
         return IO_INVALID;
     }
 
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     LPFN_ACCEPTEX lpfnAcceptEx = NULL;
     GUID GuidAcceptEx = WSAID_ACCEPTEX;
     unsigned long num;
     int ret = WSAIoctl(fd,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            &GuidAcceptEx, sizeof(GuidAcceptEx),
-            &lpfnAcceptEx, sizeof(lpfnAcceptEx),
-            &num, NULL, NULL);
+                       SIO_GET_EXTENSION_FUNCTION_POINTER,
+                       &GuidAcceptEx, sizeof(GuidAcceptEx),
+                       &lpfnAcceptEx, sizeof(lpfnAcceptEx),
+                       &num, NULL, NULL);
     if (ret == SOCKET_ERROR) {
         DEBUG_LOG("WSAIoctl failure\n");
         closesocket(fd);
         return IO_INVALID;
     }
     if (CreateIoCompletionPort((HANDLE) fd, ioc->os_handle, 0, 0) == NULL) {
-		closesocket(fd);
-		return IO_INVALID;
-	}
+        closesocket(fd);
+        return IO_INVALID;
+    }
     res->acceptfn = lpfnAcceptEx;
-    #endif
+#endif
 
     res->type = IO_RES_SOCKET;
     res->pending = 0;
@@ -831,9 +946,9 @@ io_wait_internal_windows(struct io_context *ioc,
         timeout2 = timeout;
 
     unsigned long long unused;
-	struct io_os_overlap *ov;
+    struct io_os_overlap *ov;
     unsigned long num;
-	int ok = GetQueuedCompletionStatus(ioc->os_handle, &num, &unused, (OVERLAPPED**) &ov, timeout2);
+    int ok = GetQueuedCompletionStatus(ioc->os_handle, &num, &unused, (OVERLAPPED**) &ov, timeout2);
 
     if (!ok) {
 
@@ -883,40 +998,42 @@ io_wait_internal_windows(struct io_context *ioc,
 
     switch (op->type) {
 
-        case IO_RECV:
-        case IO_SEND:
+    case IO_RECV:
+    case IO_READ:
+    case IO_SEND:
+    case IO_WRITE:
         ev->num = num;
         break;
 
-        case IO_ACCEPT:
-        {
-            struct io_resource *res2;
+    case IO_ACCEPT:
+    {
+        struct io_resource *res2;
 
-            res2 = find_unused_res(ioc);
-            if (res2 == NULL) {
+        res2 = find_unused_res(ioc);
+        if (res2 == NULL) {
 
-                closesocket((SOCKET) op->accepted);
+            closesocket((SOCKET) op->accepted);
 
-                ev->evtype = IO_ABORT;
-                ev->optype = IO_ACCEPT;
-                ev->handle = handle_from_res(ioc, res);
-                ev->user   = op->user;
+            ev->evtype = IO_ABORT;
+            ev->optype = IO_ACCEPT;
+            ev->handle = handle_from_res(ioc, res);
+            ev->user   = op->user;
     
-                assert(res->pending > 0);
-                res->pending--;
-                op->type = IO_VOID;
-                return;
-            }
-
-            res2->type = IO_RES_SOCKET;
-            res2->pending = 0;
-            res2->os_handle = op->accepted;
-
-            ev->accepted = handle_from_res(ioc, res2);
+            assert(res->pending > 0);
+            res->pending--;
+            op->type = IO_VOID;
+            return;
         }
-        break;
 
-        default:
+        res2->type = IO_RES_SOCKET;
+        res2->pending = 0;
+        res2->os_handle = op->accepted;
+
+        ev->accepted = handle_from_res(ioc, res2);
+    }
+    break;
+
+    default:
         break;
     }
 
@@ -932,12 +1049,10 @@ static void
 io_wait_internal_linux(struct io_context *ioc,
                        struct io_event *ev)
 {
-    /* --- Read barrier --- */
-    unsigned int head = atomic_load(ioc->completions.head);
-    unsigned int tail = atomic_load(ioc->completions.tail);
+    unsigned int head;
 
-    if (head == tail) {
-        
+    head = *ioc->completions.head;
+    if (head == atomic_load_explicit(ioc->completions.tail, memory_order_acquire)) {
         /*
          * Completion queue is empty. Wait for some operations to complete.
          */
@@ -964,24 +1079,25 @@ io_wait_internal_linux(struct io_context *ioc,
     ev->handle = handle_from_res(ioc, op->res);
     ev->optype = op->type;
 
-    if (cqe->res < 0)
+    if (cqe->res < 0) {
         ev->evtype = IO_ABORT;
-    else {
+        ev->num = cqe->res;
+    } else {
         ev->evtype = IO_COMPLETE;
         switch (op->type) {
-            case IO_RECV: ev->num = cqe->res; break;
-            case IO_SEND: ev->num = cqe->res; break;
-            case IO_ACCEPT: ev->accepted = cqe->res; break;
-            default:break;
+        case IO_RECV: ev->num = cqe->res; break;
+        case IO_READ: ev->num = cqe->res; break;
+        case IO_SEND: ev->num = cqe->res; break;
+        case IO_WRITE: ev->num = cqe->res; break;
+        case IO_ACCEPT: ev->accepted = cqe->res; break;
+        default:break;
         }
     }
 
     assert(res->pending > 0);
     res->pending--;
     op->type = IO_VOID; // Mark unused
-
-    /* --- write barrier --- */
-    atomic_store(ioc->completions.head, head+1);
+    atomic_store_explicit(ioc->completions.head, head+1, memory_order_release);
 }
 #endif
 
@@ -989,13 +1105,13 @@ static void
 io_wait_internal(struct io_context *ioc,
                  struct io_event *ev)
 {
-    #if IO_PLATFORM_WINDOWS
+#if IO_PLATFORM_WINDOWS
     io_wait_internal_windows(ioc, ev);
-    #endif
+#endif
 
-    #if IO_PLATFORM_LINUX
+#if IO_PLATFORM_LINUX
     io_wait_internal_linux(ioc, ev);
-    #endif
+#endif
 }
 
 void io_wait(struct io_context *ioc,
@@ -1014,10 +1130,9 @@ void io_wait(struct io_context *ioc,
         res = res_from_handle(ioc, ev->handle);
         assert(res);
 
-        if (res->callback == NULL)
+        if (res->callback == NULL ||
+            !res->callback(ioc, ev))
             break;
-
-        res->callback(ioc, *ev);
     }
 }
 

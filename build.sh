@@ -1,2 +1,4 @@
-gcc example.c  io.c -o example  -Wall -Wextra -ggdb
+gcc example.c io.c -o example -Wall -Wextra -ggdb
 gcc example2.c io.c -o example2 -Wall -Wextra -ggdb
+gcc example3.c io.c -o example3 -Wall -Wextra -ggdb
+
